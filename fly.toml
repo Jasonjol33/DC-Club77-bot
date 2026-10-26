@@ -1,5 +1,5 @@
-# Ändere den App-Namen, er muss weltweit einmalig sein!
-app = "club77-verwaltungsbot"
+# App-Name (muss zu deiner Fly-App passen)
+app = "dc-club77-bot"
 primary_region = "fra"
 
 [build]
@@ -12,3 +12,7 @@ primary_region = "fra"
   size = "shared-cpu-1x"
   memory = "256mb"
   processes = ["app"]
+
+# Bot nach einem Absturz immer wieder starten (24/7)
+[[restart]]
+  policy = "always"

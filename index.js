@@ -11,11 +11,14 @@ const {
   STAFF_ROLE_IDS = '', BANNER_URL, LOGO_URL,
   DM_ENABLED = 'true',
   EINNAHMEN_CHANNEL_ID, EINNAHMEN_KEYWORD = 'Gesamt', EINNAHMEN_WAEHRUNG = '$',
+  MESSAGE_CONTENT_INTENT = 'false',
 } = process.env;
 
 const STAFF = STAFF_ROLE_IDS.split(',').map((s) => s.trim()).filter(Boolean);
 const SERVER = 'Club 77';
 const SEND_DMS = DM_ENABLED.toLowerCase() !== 'false';
+// Nur auf true setzen, wenn im Developer Portal der "Message Content Intent" eingeschaltet ist
+const USE_MESSAGE_CONTENT = MESSAGE_CONTENT_INTENT.toLowerCase() === 'true';
 
 const C = {
   purple: 0x9b59ff, green: 0x2ecc71, red: 0xe74c3c,
@@ -162,7 +165,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // nötig, um Beträge in Nachrichten zu lesen
+    // Nötig, um Beträge in Nachrichten zu lesen (nur /einnahmen)
+    ...(USE_MESSAGE_CONTENT ? [GatewayIntentBits.MessageContent] : []),
   ],
 });
 
@@ -442,6 +446,9 @@ const handlers = {
   },
 
   async einnahmen(i) {
+    if (!USE_MESSAGE_CONTENT) {
+      return i.reply(ephemeral('❌ `/einnahmen` ist noch nicht aktiv: Der **Message Content Intent** ist nicht eingeschaltet. Setze ihn im Developer Portal und danach das Secret `MESSAGE_CONTENT_INTENT=true`.'));
+    }
     const von = parseDate(i.options.getString('anfang'));
     const bis = parseDate(i.options.getString('ende'));
     if (!von || !bis) return i.reply(ephemeral('❌ Bitte Datum im Format **TT.MM.JJJJ** angeben.'));
