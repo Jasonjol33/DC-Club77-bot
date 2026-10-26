@@ -1,0 +1,14 @@
+# Ändere den App-Namen, er muss weltweit einmalig sein!
+app = "club77-verwaltungsbot"
+primary_region = "fra"
+
+[build]
+
+# Der Bot ist ein reiner Worker (kein Webserver) -> kein [http_service]
+[processes]
+  app = "node index.js"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["app"]
