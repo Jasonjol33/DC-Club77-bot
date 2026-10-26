@@ -2,7 +2,7 @@ require('dotenv').config();
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes,
   PermissionFlagsBits, MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ActivityType, Events,
+  StringSelectMenuBuilder, ActivityType, Events, ChannelType,
 } = require('discord.js');
 
 const {
@@ -10,6 +10,7 @@ const {
   LOG_CHANNEL_ID, URLAUB_CHANNEL_ID, TICKET_CHANNEL_ID, EVENT_CHANNEL_ID,
   STAFF_ROLE_IDS = '', BANNER_URL, LOGO_URL,
   DM_ENABLED = 'true',
+  EINNAHMEN_CHANNEL_ID, EINNAHMEN_KEYWORD = 'Gesamt', EINNAHMEN_WAEHRUNG = '$',
 } = process.env;
 
 const STAFF = STAFF_ROLE_IDS.split(',').map((s) => s.trim()).filter(Boolean);
@@ -98,6 +99,13 @@ const commands = [
     .addRoleOption((o) => roleOpt(o, 'neue_position', 'Neue (niedrigere) Position'))
     .addRoleOption((o) => roleOpt(o, 'alte_position', 'Alte Position')),
 
+  new SlashCommandBuilder().setName('einnahmen')
+    .setDescription('Alle Einnahmen in einem Zeitraum zusammenrechnen')
+    .addStringOption((o) => o.setName('anfang').setDescription('Von (TT.MM.JJJJ)').setRequired(true))
+    .addStringOption((o) => o.setName('ende').setDescription('Bis (TT.MM.JJJJ)').setRequired(true))
+    .addChannelOption((o) => o.setName('channel').setDescription('Channel mit den Einnahmen (sonst Standard)')
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
+
   new SlashCommandBuilder().setName('einstellen')
     .setDescription('Einen Bewerber einstellen')
     .addUserOption((o) => userOpt(o, 'Bewerber'))
@@ -150,7 +158,13 @@ const PUBLIC_COMMANDS = ['urlaub', 'ticket', 'commands'];
 const NEEDS_MEMBER = ['einstellen', 'rankup', 'degradieren', 'kuendigen', 'addjob'];
 
 // ───────────────────────── Helfer ─────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // nötig, um Beträge in Nachrichten zu lesen
+  ],
+});
 
 const parseIds = (s = '') => s.split(',').map((x) => x.trim()).filter(Boolean);
 
@@ -235,11 +249,115 @@ const fmtDate = (d) => d.toLocaleDateString('de-DE', {
   weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'UTC',
 });
 
+// ───────────────────────── Einnahmen-Rechner ─────────────────────────
+const NUM = "\\d{1,3}(?:[.,']\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?";
+const amountRe = () => new RegExp(
+  `(?:([€$])\\s*(${NUM}))|(?:(${NUM})\\s*(?:[€$]|eur\\b|euro\\b|dollar\\b|usd\\b))`, 'gi',
+);
+const MAX_SCAN = 10000;
+
+// "1.500,50" / "1,500.50" / "1500" / "12,5" -> Zahl
+function parseAmount(raw) {
+  let s = raw.replace(/'/g, '');
+  const dot = s.lastIndexOf('.');
+  const com = s.lastIndexOf(',');
+  if (dot > -1 && com > -1) {
+    s = dot > com ? s.replace(/,/g, '') : s.replace(/\./g, '').replace(',', '.');
+  } else if (com > -1) {
+    s = /^\d+,\d{1,2}$/.test(s) ? s.replace(',', '.') : s.replace(/,/g, '');
+  } else if (dot > -1) {
+    s = /^\d{1,3}(\.\d{3})+$/.test(s) ? s.replace(/\./g, '') : s;
+  }
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Text einer Nachricht inkl. Embeds (Titel, Beschreibung, Felder)
+function messageText(m) {
+  const parts = [m.content];
+  for (const e of m.embeds ?? []) {
+    parts.push(e.title, e.description);
+    for (const f of e.fields ?? []) parts.push(`${f.name}: ${f.value}`);
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
+function amountsInLine(line) {
+  const clean = line.replace(/[*_`~]/g, '');
+  const out = [];
+  for (const m of clean.matchAll(amountRe())) {
+    const n = parseAmount(m[2] ?? m[3]);
+    if (n !== null) out.push(n);
+  }
+  return out;
+}
+
+// Mit Keyword (Standard "Gesamt") zählt pro Nachricht nur die passende Zeile –
+// steht der Betrag in der Zeile darunter, wird diese genommen.
+function extractAmounts(text) {
+  const lines = text.split('\n');
+  if (!EINNAHMEN_KEYWORD) return lines.flatMap(amountsInLine);
+  const k = EINNAHMEN_KEYWORD.toLowerCase();
+  const out = [];
+  lines.forEach((line, idx) => {
+    if (!line.toLowerCase().includes(k)) return;
+    let found = amountsInLine(line);
+    if (!found.length && lines[idx + 1]) found = amountsInLine(lines[idx + 1]);
+    out.push(...found);
+  });
+  return out;
+}
+
+// Name des Kassierers (optional, nur für die Anzeige)
+function extractWho(text) {
+  const m = /Kassierer[:\s*]*([^\n]+)/i.exec(text.replace(/[*_`~]/g, ''));
+  return m ? m[1].trim() : null;
+}
+
+// Liest den Channel rückwärts, bis der Zeitraum durch ist
+async function collectAmounts(channel, startMs, endMs) {
+  const found = [];
+  let scanned = 0;
+  let before;
+  while (scanned < MAX_SCAN) {
+    const batch = await channel.messages.fetch({ limit: 100, ...(before && { before }) });
+    if (!batch.size) break;
+    for (const m of batch.values()) {
+      scanned++;
+      if (m.createdTimestamp >= endMs || m.createdTimestamp < startMs) continue;
+      if (m.author.id === client.user.id) continue;
+      const text = messageText(m);
+      const who = extractWho(text);
+      for (const amount of extractAmounts(text)) {
+        found.push({ amount, who, ts: m.createdTimestamp, url: m.url });
+      }
+    }
+    before = batch.last().id;
+    if (batch.last().createdTimestamp < startMs) break;
+  }
+  found.sort((a, b) => a.ts - b.ts);
+  return { found, scanned };
+}
+
+// 00:00 Uhr deutscher Zeit (Sommer-/Winterzeit berücksichtigt)
+const berlinOffsetMs = (utcMs) => {
+  const p = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Berlin', hourCycle: 'h23',
+    year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(new Date(utcMs));
+  const g = (t) => +p.find((x) => x.type === t).value;
+  return Date.UTC(g('year'), g('month') - 1, g('day'), g('hour'), g('minute'), g('second')) - utcMs;
+};
+const berlinMidnight = (d) => d.getTime() - berlinOffsetMs(d.getTime());
+
+const money = (n) => `${n.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${EINNAHMEN_WAEHRUNG}`;
+
 // ───────────────────────── Hilfe-Menü (/commands) ─────────────────────────
 const CATS = {
   all: { label: 'Alle Befehle', emoji: '📚', desc: 'Komplette Übersicht', cmds: commands.map((c) => c.name) },
   personal: { label: 'Personalverwaltung', emoji: '🛡️', desc: 'Einstellen, Rank, Kündigung', cmds: ['einstellen', 'rankup', 'degradieren', 'kuendigen', 'ausgang', 'abwesend', 'addjob'] },
   bewerber: { label: 'Bewerber', emoji: '📝', desc: 'Gespräch, Lizenz, Visum', cmds: ['gespreach', 'lizens', 'visum'] },
+  finanzen: { label: 'Finanzen', emoji: '💰', desc: 'Einnahmen auswerten', cmds: ['einnahmen'] },
   events: { label: 'Events', emoji: '🎉', desc: 'Halloween, Weihnachten, Ostern …', cmds: ['event'] },
   allgemein: { label: 'Allgemein', emoji: '🌐', desc: 'Urlaub, Ticket, Hilfe', cmds: ['urlaub', 'ticket', 'commands'] },
 };
@@ -321,6 +439,58 @@ const handlers = {
     });
     dm(member, e);
     return postEmbed(i, { embeds: [e] });
+  },
+
+  async einnahmen(i) {
+    const von = parseDate(i.options.getString('anfang'));
+    const bis = parseDate(i.options.getString('ende'));
+    if (!von || !bis) return i.reply(ephemeral('❌ Bitte Datum im Format **TT.MM.JJJJ** angeben.'));
+    if (bis < von) return i.reply(ephemeral('❌ Das Ende liegt vor dem Anfang.'));
+
+    const ch = i.options.getChannel('channel')
+      ?? (EINNAHMEN_CHANNEL_ID ? await i.guild.channels.fetch(EINNAHMEN_CHANNEL_ID).catch(() => null) : i.channel);
+    if (!ch || !ch.isTextBased()) {
+      return i.reply(ephemeral('❌ Einnahmen-Channel nicht gefunden (EINNAHMEN_CHANNEL_ID prüfen).'));
+    }
+
+    await i.deferReply();
+    const startMs = berlinMidnight(von);
+    const endMs = berlinMidnight(new Date(bis.getTime() + 86400000));
+
+    let result;
+    try {
+      result = await collectAmounts(ch, startMs, endMs);
+    } catch (err) {
+      console.error(err);
+      return i.editReply('❌ Ich kann die Nachrichten in diesem Channel nicht lesen. Der Bot braucht **Kanal ansehen** und **Nachrichtenverlauf anzeigen**.');
+    }
+    const { found, scanned } = result;
+    const total = found.reduce((sum, x) => sum + x.amount, 0);
+
+    const lines = [];
+    let len = 0;
+    for (const [n, x] of found.entries()) {
+      const line = `\`${String(n + 1).padStart(2, '0')}.\` <t:${Math.floor(x.ts / 1000)}:d>${x.who ? ` • ${x.who}` : ''} • **${money(x.amount)}** • [Nachricht](${x.url})`;
+      if (len + line.length > 3300) {
+        lines.push(`… und **${found.length - n}** weitere Einträge`);
+        break;
+      }
+      lines.push(line);
+      len += line.length + 1;
+    }
+
+    const e = mk(i, {
+      icon: '💰', title: 'Einnahmen-Auswertung', color: C.gold,
+      desc: found.length
+        ? lines.join('\n')
+        : `_Im Zeitraum wurden keine Beträge gefunden._\nPrüfe Zeitraum und Channel. Gezählt wird pro Nachricht die Zeile mit **${EINNAHMEN_KEYWORD || 'Betrag'}**.`,
+      fields: [
+        F('📆 Zeitraum', `${fmtDate(von)} – ${fmtDate(bis)}`, false),
+        F('📨 Channel', `${ch}`), F('🧾 Einträge', found.length), F('🔍 Geprüft', `${scanned} Nachrichten`),
+        F('💵 Gesamtsumme', `**${money(total)}**`, false),
+      ],
+    });
+    return i.editReply({ embeds: [e] });
   },
 
   async einstellen(i) {
