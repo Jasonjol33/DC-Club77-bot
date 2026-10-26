@@ -1,14 +1,25 @@
-# Ändere den App-Namen, er muss weltweit einmalig sein!
-app = "club77-verwaltungsbot"
-primary_region = "fra"
+# fly.toml app configuration file generated for dc-club77-bot on 2026-10-26T20:57:38Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'dc-club77-bot'
+primary_region = 'fra'
 
 [build]
 
-# Der Bot ist ein reiner Worker (kein Webserver) -> kein [http_service]
 [processes]
-  app = "node index.js"
+  app = 'node index.js'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
-  processes = ["app"]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+  processes = ['app']
