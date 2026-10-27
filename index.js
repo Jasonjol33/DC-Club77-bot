@@ -298,10 +298,10 @@ function amountsInLine(line) {
 
 // Mit Keyword (Standard "Gesamt") zählt pro Nachricht nur die passende Zeile –
 // steht der Betrag in der Zeile darunter, wird diese genommen.
-function extractAmounts(text) {
+function extractAmounts(text, keyword = EINNAHMEN_KEYWORD) {
   const lines = text.split('\n');
-  if (!EINNAHMEN_KEYWORD) return lines.flatMap(amountsInLine);
-  const k = EINNAHMEN_KEYWORD.toLowerCase();
+  if (!keyword) return lines.flatMap(amountsInLine);
+  const k = keyword.toLowerCase();
   const out = [];
   lines.forEach((line, idx) => {
     if (!line.toLowerCase().includes(k)) return;
@@ -314,13 +314,51 @@ function extractAmounts(text) {
 
 // Name des Kassierers (optional, nur für die Anzeige)
 function extractWho(text) {
-  const m = /Kassierer[:\s*]*([^\n]+)/i.exec(text.replace(/[*_`~]/g, ''));
+  const m = /Kassierer(?:\s+des\s+Bons)?[:\s*]*([^\n]+)/i.exec(text.replace(/[*_`~]/g, ''));
   return m ? m[1].trim() : null;
+}
+
+// ───── Kassen-Meldungen erkennen (Bon / Storno / Tagesumsatz) ─────
+// Ein "Geschäftstag" beginnt wie im Kassensystem um 06:00 Uhr (Secret KASSE_TAGESBEGINN, Standard 6).
+const TAGESBEGINN = parseInt(process.env.KASSE_TAGESBEGINN ?? '6', 10) || 0;
+const berlinDay = (ts) => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(new Date(ts - TAGESBEGINN * 3600000));
+
+function classify(text) {
+  const t = text.replace(/[*_`~]/g, '');
+  if (/Storno\s+S-\d+/i.test(t) || /Storno-Betrag/i.test(t)) return 'storno';
+  if (/\bBon\s+R-\d+/i.test(t)) return 'bon';
+  if (/Tagesumsatz/i.test(t)) return 'tag';
+  return 'other';
+}
+
+// Betrag der Zeile "Storno-Betrag" (immer als MINUS gezählt – bei Rabatt ist das der Betrag nach Rabatt)
+function stornoAmount(text) {
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (!/Storno-Betrag/i.test(lines[i])) continue;
+    let found = amountsInLine(lines[i]);
+    if (!found.length && lines[i + 1]) found = amountsInLine(lines[i + 1]);
+    if (found.length) return -Math.abs(found[0]);
+  }
+  return null;
+}
+
+function entriesFromMessage(text) {
+  const kind = classify(text);
+  if (kind === 'storno') {
+    const a = stornoAmount(text);
+    return a === null ? [] : [{ amount: a, kind }];
+  }
+  // Bon: immer nur die Zeile "Gesamt" (Betrag nach Rabatt), egal welches Keyword gesetzt ist
+  if (kind === 'bon') return extractAmounts(text, 'Gesamt').slice(0, 1).map((amount) => ({ amount, kind }));
+  return extractAmounts(text).map((amount) => ({ amount, kind }));
 }
 
 // Liest den Channel rückwärts, bis der Zeitraum durch ist
 async function collectAmounts(channel, startMs, endMs) {
-  const found = [];
+  let found = [];
   let scanned = 0;
   let before;
   while (scanned < MAX_SCAN) {
@@ -332,15 +370,21 @@ async function collectAmounts(channel, startMs, endMs) {
       if (m.author.id === client.user.id) continue;
       const text = messageText(m);
       const who = extractWho(text);
-      for (const amount of extractAmounts(text)) {
-        found.push({ amount, who, ts: m.createdTimestamp, url: m.url });
+      for (const e of entriesFromMessage(text)) {
+        found.push({ ...e, who, ts: m.createdTimestamp, url: m.url, day: berlinDay(m.createdTimestamp) });
       }
     }
     before = batch.last().id;
     if (batch.last().createdTimestamp < startMs) break;
   }
+  // Gibt es an einem Tag Einzel-Bons/Stornos, wird der Tagesumsatz-Bericht dieses Tages NICHT zusätzlich gezählt
+  // (sonst würde alles doppelt zählen). Tage ohne Bons (z. B. alte Berichte) zählen weiter über den Tagesbericht.
+  const bonDays = new Set(found.filter((x) => x.kind === 'bon' || x.kind === 'storno').map((x) => x.day));
+  const before2 = found.length;
+  found = found.filter((x) => x.kind !== 'tag' || !bonDays.has(x.day));
+  const ignored = before2 - found.length;
   found.sort((a, b) => a.ts - b.ts);
-  return { found, scanned };
+  return { found, scanned, ignored };
 }
 
 // 00:00 Uhr deutscher Zeit (Sommer-/Winterzeit berücksichtigt)
@@ -471,13 +515,13 @@ const handlers = {
       console.error(err);
       return i.editReply('❌ Ich kann die Nachrichten in diesem Channel nicht lesen. Der Bot braucht **Kanal ansehen** und **Nachrichtenverlauf anzeigen**.');
     }
-    const { found, scanned } = result;
+    const { found, scanned, ignored } = result;
     const total = found.reduce((sum, x) => sum + x.amount, 0);
 
     const lines = [];
     let len = 0;
     for (const [n, x] of found.entries()) {
-      const line = `\`${String(n + 1).padStart(2, '0')}.\` <t:${Math.floor(x.ts / 1000)}:d>${x.who ? ` • ${x.who}` : ''} • **${money(x.amount)}** • [Nachricht](${x.url})`;
+      const line = `\`${String(n + 1).padStart(2, '0')}.\` <t:${Math.floor(x.ts / 1000)}:d>${x.kind === 'storno' ? ' • ↩️ Storno' : ''}${x.who ? ` • ${x.who}` : ''} • **${money(x.amount)}** • [Nachricht](${x.url})`;
       if (len + line.length > 3300) {
         lines.push(`… und **${found.length - n}** weitere Einträge`);
         break;
@@ -494,6 +538,8 @@ const handlers = {
       fields: [
         F('📆 Zeitraum', `${fmtDate(von)} – ${fmtDate(bis)}`, false),
         F('📨 Channel', `${ch}`), F('🧾 Einträge', found.length), F('🔍 Geprüft', `${scanned} Nachrichten`),
+        ...(found.some((x) => x.kind === 'storno') ? [F('↩️ Stornos abgezogen', `${found.filter((x) => x.kind === 'storno').length} (${money(found.filter((x) => x.kind === 'storno').reduce((a, x) => a + x.amount, 0))})`, false)] : []),
+        ...(ignored ? [F('ℹ️ Hinweis', `${ignored} Tagesumsatz-Bericht(e) nicht mitgezählt, weil an diesen Tagen die einzelnen Bons gezählt wurden (kein doppeltes Zählen).`, false)] : []),
         F('💵 Gesamtsumme', `**${money(total)}**`, false),
       ],
     });
